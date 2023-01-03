@@ -26,6 +26,8 @@ type Server struct {
 
 	Auth Auth `json:"auth"`
 
+	OnConn func(sourceConn net.Conn, sourceHostPortString, targetHostPortString string) (targetConn net.Conn, err error)
+
 	OnConnect func(conn net.Conn, source, target string)
 }
 
@@ -71,28 +73,28 @@ func (s *Server) process(client net.Conn) {
 }
 
 // Auth Request Protocol:
-// 	VER | NMETHODS | METHODS
-// 	1   | 1        | 1
 //
-// 	VER - 本次请求的协议版本号，取固定值 0x05（表示socks 5）
-//  NMETHODS - 客户端支持的认证方式数量，可取值 1~255
-//  METHODS - 可用的认证方式列表
+//		VER | NMETHODS | METHODS
+//		1   | 1        | 1
 //
-//		0x00 NO AUTHENTICATION REQUIRED 无需认证
-// 		0x01 GSSAPI
-// 		0x02 USERNAME/PASSWORD 无需认证
-// 		0x03 to 0x7F IANA ASSIGNED
-// 		0x80 to 0xFE REVERSED FOR PRIVATE METHODS
-// 		0xFF NO ACCEPTABLE METHODS
+//		VER - 本次请求的协议版本号，取固定值 0x05（表示socks 5）
+//	 NMETHODS - 客户端支持的认证方式数量，可取值 1~255
+//	 METHODS - 可用的认证方式列表
 //
+//			0x00 NO AUTHENTICATION REQUIRED 无需认证
+//			0x01 GSSAPI
+//			0x02 USERNAME/PASSWORD 无需认证
+//			0x03 to 0x7F IANA ASSIGNED
+//			0x80 to 0xFE REVERSED FOR PRIVATE METHODS
+//			0xFF NO ACCEPTABLE METHODS
 //
 // Auth Response Protocol:
-//   VER | METHOD
-//   1   |   1
 //
-//   VER 		- 协议版本
-//   METHOD - 服务端期望的认证方式
+//	VER | METHOD
+//	1   |   1
 //
+//	VER 		- 协议版本
+//	METHOD - 服务端期望的认证方式
 func (s *Server) authenticate(client net.Conn) error {
 	buf := make([]byte, 256)
 
@@ -123,28 +125,28 @@ func (s *Server) authenticate(client net.Conn) error {
 }
 
 // Connect Request Protocol:
-//   VER | CMD | RSV  | ATYP | DST.ADDR | DST.PORT
-//    1  |  1  | 0x00 |  1   | Variable | 2
 //
-//   VER - 本次请求的协议版本号，取固定值 0x05（表示socks 5）
-//   CMD - 连接方式，0x01:CONNECT, 0x02:BIND, 0x03:UDP ASSOCAITE
-//   RSV - 保留字段，没用
-//   ATYP - 地址类型，0x01:IPv4, 0x03:域名, 0x04:IPv6
-//   DST.ADDR - 目标地址
-//   DST.PORT - 目标端口，2字节，网络字节序（network octec order）
+//	  VER | CMD | RSV  | ATYP | DST.ADDR | DST.PORT
+//	   1  |  1  | 0x00 |  1   | Variable | 2
+//
+//	  VER - 本次请求的协议版本号，取固定值 0x05（表示socks 5）
+//	  CMD - 连接方式，0x01:CONNECT, 0x02:BIND, 0x03:UDP ASSOCAITE
+//	  RSV - 保留字段，没用
+//	  ATYP - 地址类型，0x01:IPv4, 0x03:域名, 0x04:IPv6
+//	  DST.ADDR - 目标地址
+//	  DST.PORT - 目标端口，2字节，网络字节序（network octec order）
 //
 //
-// 	Connect Response Protocl:
-//  	VER | REP | RSV  | ATYP | BND.ADDR | BND.PORT
-//    1   |  1  | 0x00 |  1   | Variable | 2
+//		Connect Response Protocl:
+//	 	VER | REP | RSV  | ATYP | BND.ADDR | BND.PORT
+//	   1   |  1  | 0x00 |  1   | Variable | 2
 //
-//    VER  - 本次请求的协议版本号，取固定值 0x05（表示socks 5）
-//    REP  - 状态码，0x00:成功，0x01:失败
-//    RSV  - 保留字段，没用
-//    ATYP - 地址类型，0x01:IPv4, 0x03:域名, 0x04:IPv6
-//    BND.ADDR - 服务器和 DST 创建连接的地址，基本上没用，默认用: 0
-//    BND.PORT - 服务器和 DST 创建连接的端口，基本上没用，默认用：0
-//
+//	   VER  - 本次请求的协议版本号，取固定值 0x05（表示socks 5）
+//	   REP  - 状态码，0x00:成功，0x01:失败
+//	   RSV  - 保留字段，没用
+//	   ATYP - 地址类型，0x01:IPv4, 0x03:域名, 0x04:IPv6
+//	   BND.ADDR - 服务器和 DST 创建连接的地址，基本上没用，默认用: 0
+//	   BND.PORT - 服务器和 DST 创建连接的端口，基本上没用，默认用：0
 func (s *Server) connect(client net.Conn) (net.Conn, error) {
 	buf := make([]byte, 256)
 
@@ -212,18 +214,29 @@ func (s *Server) connect(client net.Conn) (net.Conn, error) {
 		s.OnConnect(client, client.RemoteAddr().String(), destAddrPort)
 	}
 
-	dest, err := net.Dial("tcp", destAddrPort)
+	var source net.Conn = client
+	var target net.Conn
+	if s.OnConn != nil {
+		target, err = s.OnConn(source, client.RemoteAddr().String(), destAddrPort)
+		if err != nil {
+			source.Close()
+			return nil, fmt.Errorf("[tcp] failed to connect to server: %v", err)
+		}
+	} else {
+		target, err = net.Dial("tcp", destAddrPort)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("dial dst: %s", err)
 	}
 
-	_, err = client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	_, err = source.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	if err != nil {
-		dest.Close()
+		target.Close()
 		return nil, fmt.Errorf("write response: %s", err)
 	}
 
-	return dest, nil
+	return target, nil
 }
 
 func (s *Server) forward(client net.Conn, target net.Conn) {
