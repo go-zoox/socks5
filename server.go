@@ -45,9 +45,8 @@ type Auth struct {
 }
 
 func (s *Server) Run(addr string) error {
-	tcpServer := tcp.Server{}
-
-	return tcpServer.Run(addr, func(client net.Conn) {
+	// use embedded tcp.Server so that any configuration on Server is honored
+	return s.Server.Run(addr, func(client net.Conn) {
 		s.process(client)
 	})
 }
@@ -115,8 +114,38 @@ func (s *Server) authenticate(client net.Conn) error {
 		return fmt.Errorf("reading methods: %s", err)
 	}
 
-	// @TODO 这里写死认证方式：无需认证
-	_, err = client.Write([]byte{0x05, 0x00})
+	// decide auth method based on server config; currently only "none" (no auth) is supported.
+	// if method is not "none" or empty, we still fail with NO ACCEPTABLE METHODS for now.
+	method := s.Auth.Method
+	if method == "" {
+		method = "none"
+	}
+
+	var selectedMethod byte
+	switch method {
+	case "none":
+		selectedMethod = 0x00
+	default:
+		// not implemented yet: credentials, token, etc.
+		// respond with 0xFF (NO ACCEPTABLE METHODS)
+		_, _ = client.Write([]byte{0x05, 0xFF})
+		return fmt.Errorf("unsupported auth method %q", method)
+	}
+
+	// ensure client actually offered the selectedMethod
+	supported := false
+	for i := 0; i < nMethods; i++ {
+		if buf[i] == selectedMethod {
+			supported = true
+			break
+		}
+	}
+	if !supported {
+		_, _ = client.Write([]byte{0x05, 0xFF})
+		return fmt.Errorf("client does not support required auth method %d", selectedMethod)
+	}
+
+	_, err = client.Write([]byte{0x05, selectedMethod})
 	if err != nil {
 		return fmt.Errorf("writing methods: %s", err)
 	}
@@ -208,7 +237,7 @@ func (s *Server) connect(client net.Conn) (net.Conn, error) {
 	}
 	port := binary.BigEndian.Uint16(buf[:2])
 
-	destAddrPort := fmt.Sprintf("%s:%d", addr, port)
+	destAddrPort := net.JoinHostPort(addr, fmt.Sprintf("%d", port))
 	// logger.Info("[%s] connect to %s", client.RemoteAddr().String(), destAddrPort)
 	if s.OnConnect != nil {
 		s.OnConnect(client, client.RemoteAddr().String(), destAddrPort)

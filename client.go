@@ -61,15 +61,55 @@ func (c *Client) connect(host string, port int) error {
 		return fmt.Errorf("failed to connect to %s:%d(error: %v)", host, port, err)
 	}
 
-	// Response
-	buf := make([]byte, 256)
-	n, err := io.ReadFull(c.conn, buf[:2])
-	if n != 2 {
-		return fmt.Errorf("failed to read header: %s", err)
+	// Response: VER | REP | RSV | ATYP | BND.ADDR | BND.PORT
+	header := make([]byte, 4)
+	n, err := io.ReadFull(c.conn, header)
+	if n != 4 {
+		return fmt.Errorf("failed to read header: %v", err)
 	}
-	rep := buf[1]
+
+	ver, rep, _, atyp := header[0], header[1], header[2], header[3]
+	if ver != Version5 {
+		return fmt.Errorf("unexpected SOCKS version in reply: %d", ver)
+	}
 	if rep != 0x00 {
-		return fmt.Errorf("failed to connect to %s:%d(rep: %d)", host, port, rep)
+		return fmt.Errorf("failed to connect to %s:%d (rep=%d)", host, port, rep)
+	}
+
+	// consume BND.ADDR according to ATYP and then BND.PORT so that no leftover bytes
+	// from the CONNECT response will pollute subsequent application data.
+	switch atyp {
+	case AddrTypeIPv4:
+		addr := make([]byte, 4)
+		if _, err := io.ReadFull(c.conn, addr); err != nil {
+			return fmt.Errorf("failed to read IPv4 bind address: %v", err)
+		}
+	case AddrTypeFQDN:
+		// first length byte, then host bytes
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(c.conn, lenBuf); err != nil {
+			return fmt.Errorf("failed to read domain length: %v", err)
+		}
+		l := int(lenBuf[0])
+		if l > 0 {
+			hostBuf := make([]byte, l)
+			if _, err := io.ReadFull(c.conn, hostBuf); err != nil {
+				return fmt.Errorf("failed to read domain: %v", err)
+			}
+		}
+	case AddrTypeIPv6:
+		addr := make([]byte, 16)
+		if _, err := io.ReadFull(c.conn, addr); err != nil {
+			return fmt.Errorf("failed to read IPv6 bind address: %v", err)
+		}
+	default:
+		return fmt.Errorf("unsupported ATYP in reply: %d", atyp)
+	}
+
+	// read BND.PORT (2 bytes)
+	portBuf := make([]byte, 2)
+	if _, err := io.ReadFull(c.conn, portBuf); err != nil {
+		return fmt.Errorf("failed to read bind port: %v", err)
 	}
 
 	return nil
@@ -96,35 +136,28 @@ func (c *Client) Connect(host string, port int, data []byte) ([]byte, error) {
 	}
 
 	if _, err := c.conn.Write(data); err != nil {
+		_ = c.conn.Close()
+		c.conn = nil
 		return nil, fmt.Errorf("failed to write: %v", err)
 	}
 
-	// response, err := io.ReadAll(c.conn)
-	// if err != nil {
-	// 	return nil, fmt.Errorf("failed to read response: %v", err)
-	// }
-
-	b := make([]byte, 0, 512)
+	// read all response until EOF; this matches the CLI usage where the
+	// server/remote closes the connection when done.
+	var resp []byte
+	buf := make([]byte, 4096)
 	for {
-		if len(b) == cap(b) {
-			b = append(b, 0)[:len(b)]
+		n, err := c.conn.Read(buf)
+		if n > 0 {
+			resp = append(resp, buf[:n]...)
 		}
-
-		n, err := c.conn.Read(b[len(b):cap(b)])
-		b = b[:len(b)+n]
 		if err != nil {
 			if err == io.EOF {
 				err = nil
 			}
-
-			return b, err
+			// close and reset connection on any read error/EOF to avoid reusing bad state
+			_ = c.conn.Close()
+			c.conn = nil
+			return resp, err
 		}
-
-		// fmt.Println("n:", n)
-
-		// // @TODO
-		// if n != 8 && n != 512 {
-		// 	return b, nil
-		// }
 	}
 }
